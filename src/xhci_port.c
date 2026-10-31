@@ -66,10 +66,10 @@ static bool xhci_port_wait_change(xhci_hc_t *hc, uint8_t port, uint32_t change) 
 
 // usb2 ports sit disabled until we reset them, usb3 ones train the link themselves
 // and only get a reset if that didnt work out (4.3.1)
-static bool xhci_port_reset(xhci_hc_t *hc, uint8_t port) {
+static bool xhci_port_reset(xhci_hc_t *hc, uint8_t port, bool force) {
     bool usb3 = hc->port_major[port] == 3;
 
-    if (usb3 && (xhci_portsc(hc, port) & XHCI_PORTSC_PED))
+    if (usb3 && !force && (xhci_portsc(hc, port) & XHCI_PORTSC_PED))
         return true;
 
     xhci_portsc_write(hc, port, XHCI_PORTSC_PR);
@@ -98,13 +98,27 @@ static bool xhci_port_reset(xhci_hc_t *hc, uint8_t port) {
     return true;
 }
 
-static void xhci_port_connect(xhci_hc_t *hc, uint8_t port) {
+// plenty of real devices fumble the first go right after a reset
+static void xhci_port_connect(xhci_hc_t *hc, uint8_t port, bool force) {
     xhci_port_log(hc, port, "connected");
-    if (!xhci_port_reset(hc, port))
-        return;
-    xhci_port_log(hc, port, "enabled");
 
-    xhci_device_attach(hc, port, XHCI_PORTSC_SPEED(xhci_portsc(hc, port)));
+    for (int tries = 0; tries < XHCI_ATTACH_TRIES; tries++) {
+        if (!(xhci_portsc(hc, port) & XHCI_PORTSC_CCS)) {
+            xhci_port_log(hc, port, "gone before it attached");
+            return;
+        }
+
+        if (xhci_port_reset(hc, port, force || tries > 0)) {
+            xhci_port_log(hc, port, "enabled");
+            if (xhci_device_attach(hc, port, XHCI_PORTSC_SPEED(xhci_portsc(hc, port))))
+                return;
+        }
+
+        serial_printf(LOG_WARN "xhci%d: port %u attach try %d of %d failed\n",
+                      hc->index, port, tries + 1, XHCI_ATTACH_TRIES);
+        usb_delay_ms(XHCI_ATTACH_RETRY_MS);
+    }
+    xhci_port_log(hc, port, "giving up on it");
 }
 
 void xhci_ports_probe(xhci_hc_t *hc) {
@@ -125,7 +139,7 @@ void xhci_ports_probe(xhci_hc_t *hc) {
             xhci_trace("xhci%d: port %u empty, portsc=0x%08x\n", hc->index, port, portsc);
             continue;
         }
-        xhci_port_connect(hc, port);
+        xhci_port_connect(hc, port, false);
     }
 }
 
@@ -153,6 +167,7 @@ static void xhci_port_service(xhci_hc_t *hc, uint8_t port) {
         return;
 
     xhci_port_log(hc, port, present ? "plugged" : "unplugged");
+    hc->port_resets[port] = 0;
 
     if (slot_id && hc->slots[slot_id])
         xhci_device_detach(hc, hc->slots[slot_id]);
@@ -161,10 +176,25 @@ static void xhci_port_service(xhci_hc_t *hc, uint8_t port) {
     if (present) {
         usb_delay_ms(XHCI_PORT_DEBOUNCE_MS);
         if (xhci_portsc(hc, port) & XHCI_PORTSC_CCS)
-            xhci_port_connect(hc, port);
+            xhci_port_connect(hc, port, false);
         else
             xhci_port_log(hc, port, "gone again before it settled");
     }
+}
+
+// the device stopped making sense but its still plugged in, start it over like a replug
+void xhci_port_redo(xhci_hc_t *hc, uint8_t port) {
+    uint8_t slot_id = hc->port_slot[port];
+
+    if (++hc->port_resets[port] > XHCI_PORT_MAX_RESETS) {
+        xhci_port_log(hc, port, "wont stay up, leaving it until its replugged");
+        return;
+    }
+    xhci_port_log(hc, port, "resetting the device");
+
+    if (slot_id && hc->slots[slot_id])
+        xhci_device_detach(hc, hc->slots[slot_id]);
+    xhci_port_connect(hc, port, true);
 }
 
 void xhci_ports_service(xhci_hc_t *hc) {

@@ -242,8 +242,10 @@ static bool xhci_controller_init(xhci_hc_t *hc) {
 
 static void xhci_hotplug(void) {
     for (int i = 0; i < xhci_count; i++) {
-        if (xhci_controllers[i].running)
-            xhci_ports_service(&xhci_controllers[i]);
+        if (!xhci_controllers[i].running)
+            continue;
+        xhci_ports_service(&xhci_controllers[i]);
+        xhci_pipes_service(&xhci_controllers[i]);
     }
 }
 

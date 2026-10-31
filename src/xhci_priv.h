@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <usb/usb.h>
 #include <usb/usb_hcd.h>
+#include <usb/usb_hub.h>
 #include "xhci_regs.h"
 #include <pci/pci.h>
 #include <drivers/serial/serial.h>
@@ -16,7 +17,7 @@
 #include <ansii.h>
 #include <stdio.h>
 
-#define XHCI_MAX_CONTROLLERS    2
+#define XHCI_MAX_CONTROLLERS    8
 #define XHCI_MAX_SLOTS          32      // devices per controller we bother with
 #define XHCI_MAX_DCI            32      // device context index, ep0 is 1 and 31 is ep15 in
 #define XHCI_RING_TRBS          256     // a page worth, the last one is the link back
@@ -33,6 +34,10 @@
 #define XHCI_PORT_POWER_MS      20
 #define XHCI_PORT_DEBOUNCE_MS   100     // usb2 spec wants 100ms between attach and reset
 #define XHCI_PIPE_MAX_ERRORS    8
+#define XHCI_PIPE_MAX_RECOVERS  3       // unhalts in a row with no report, then the device gets reset
+#define XHCI_PORT_MAX_RESETS    3       // same but resets, then we leave it alone until a replug
+#define XHCI_ATTACH_TRIES       3
+#define XHCI_ATTACH_RETRY_MS    50
 
 // not a real completion code, what a wait returns when the device got unplugged under it
 #define XHCI_CC_GONE            0xFF
@@ -61,6 +66,7 @@ typedef struct xhci_ep {
     bool        used;
     bool        halted;         // the controller stopped it after an error, needs a reset
     uint8_t     dci;
+    uint8_t     address;
     uint8_t     type;           // XHCI_EP_TYPE_*
     uint16_t    max_packet;
     xhci_ring_t ring;
@@ -72,6 +78,8 @@ typedef struct xhci_ep {
     uint8_t    *buf;
     paddr_t     buf_phys;
     uint8_t     errors;
+    uint8_t     recovers;
+    volatile bool broken;       // stopped, usb_service has to bring it back
 } xhci_ep_t;
 
 struct xhci_hc;
@@ -80,6 +88,9 @@ typedef struct xhci_slot {
     struct xhci_hc *hc;
     uint8_t      id;
     uint8_t      port;          // root port, counted from 1 like the spec does
+    uint32_t     route;         // hub ports on the way down, a nibble per tier
+    uint8_t      tt_slot;       // high speed hub doing the translating for low and full speed
+    uint8_t      tt_port;
     uint8_t      speed;         // XHCI_SPEED_*
     uint8_t      context_entries;
 
@@ -114,6 +125,8 @@ typedef struct xhci_hc {
     uint8_t      port_major[256];   // usb 2 or 3 per port, from the protocol capabilities
     uint8_t      port_slot[256];    // whats plugged into each port, 0 for nothing
     volatile uint32_t ports_changed[256 / 32];  // set by the event handler, usb_service clears
+    uint8_t      port_resets[256];  // since it last worked or got replugged
+    volatile bool pipes_broken;     // some interrupt pipe needs usb_service
 
     uint64_t    *dcbaa;
     paddr_t      dcbaa_phys;
@@ -202,9 +215,13 @@ usb_speed_t xhci_usb_speed(uint8_t speed);
 
 // xhci_port.c hotplug, runs in usb_service
 void        xhci_ports_service(xhci_hc_t *hc);
+void        xhci_port_redo(xhci_hc_t *hc, uint8_t port);
 
 // xhci_device.c
-void xhci_device_attach(xhci_hc_t *hc, uint8_t port, uint8_t speed);
+bool xhci_device_attach(xhci_hc_t *hc, uint8_t port, uint8_t speed);
+usb_device_t *xhci_device_add(usb_device_t *hub, uint8_t port, usb_speed_t speed);
+void xhci_device_remove(usb_device_t *dev);
+int  xhci_hub_setup(usb_device_t *dev, uint8_t ports, uint8_t think_time);
 void xhci_device_detach(xhci_hc_t *hc, xhci_slot_t *slot);
 int  xhci_endpoint_add(xhci_slot_t *slot, const usb_endpoint_desc_t *desc, uint8_t burst);
 
@@ -212,3 +229,4 @@ int  xhci_endpoint_add(xhci_slot_t *slot, const usb_endpoint_desc_t *desc, uint8
 extern const usb_hc_ops_t xhci_ops;
 int  xhci_control(usb_device_t *dev, const usb_setup_t *setup, void *data);
 void xhci_transfer_event(xhci_hc_t *hc, const xhci_trb_t *event);
+void xhci_pipes_service(xhci_hc_t *hc);

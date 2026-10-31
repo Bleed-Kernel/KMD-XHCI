@@ -36,12 +36,17 @@ static void xhci_pipe_arm(xhci_slot_t *slot, xhci_ep_t *ep) {
 }
 
 // interrupt pipes run off the event ring so they cant issue commands from in here,
-// a halted pipe just stops. the controller already retried it 3 times by then
+// a halted pipe waits for usb_service. the controller already retried it 3 times by then
 static void xhci_pipe_complete(xhci_slot_t *slot, xhci_ep_t *ep) {
     uint8_t cc = ep->xfer.cc;
 
     if (xhci_cc_ok(cc)) {
-        ep->errors = 0;
+        ep->errors   = 0;
+        ep->recovers = 0;
+        if (slot->dev.parent)
+            usb_hub_port_ok(&slot->dev);
+        else
+            slot->hc->port_resets[slot->port] = 0;
         ep->cb(ep->ctx, ep->buf, ep->xfer.actual);
         xhci_pipe_arm(slot, ep);
         return;
@@ -51,10 +56,8 @@ static void xhci_pipe_complete(xhci_slot_t *slot, xhci_ep_t *ep) {
                   slot->hc->index, slot->id, ep->dci, xhci_cc_name(cc), cc);
 
     if (ep->halted || ++ep->errors >= XHCI_PIPE_MAX_ERRORS) {
-        // probably got unplugged, stop asking
-        serial_printf(LOG_WARN "xhci%d: slot %u dci %u keeps failing, giving up on it\n",
-                      slot->hc->index, slot->id, ep->dci);
-        ep->cb = NULL;
+        ep->broken             = true;
+        slot->hc->pipes_broken = true;
         return;
     }
     xhci_pipe_arm(slot, ep);
@@ -302,6 +305,57 @@ static int xhci_reset_endpoint(usb_device_t *dev, uint8_t endpoint) {
     return xhci_ep_skip(slot, ep);
 }
 
+// false means the pipe cant be saved and the device has to start over again
+static bool xhci_pipe_recover(xhci_slot_t *slot, xhci_ep_t *ep) {
+    ep->broken = false;
+    if (++ep->recovers > XHCI_PIPE_MAX_RECOVERS)
+        return false;
+
+    serial_printf(LOG_INFO "xhci%d: slot %u bringing endpoint 0x%02x back, try %u\n",
+                  slot->hc->index, slot->id, ep->address, ep->recovers);
+
+    // both ends have to go back to the same data toggle
+    int r = usb_clear_halt(&slot->dev, ep->address);
+    if (r < 0 && r != USB_ERR_STALL)
+        return false;
+
+    ep->errors = 0;
+    unsigned long irq = irq_push();
+    xhci_pipe_arm(slot, ep);
+    irq_restore(irq);
+    return true;
+}
+
+// usb_service, a dead pipe has to be fixed somewhere that can wait on commands
+void xhci_pipes_service(xhci_hc_t *hc) {
+    if (!hc->pipes_broken)
+        return;
+    hc->pipes_broken = false;
+
+    for (uint32_t id = 1; id <= XHCI_MAX_SLOTS; id++) {
+        xhci_slot_t *slot = hc->slots[id];
+        if (!slot)
+            continue;
+
+        for (int dci = 2; dci < XHCI_MAX_DCI; dci++) {
+            xhci_ep_t *ep = &slot->eps[dci];
+            if (!ep->broken || !ep->cb)
+                continue;
+
+            if (!(xhci_op_read(hc, XHCI_OP_PORTSC(slot->port)) & XHCI_PORTSC_CCS))
+                break;
+
+            if (!xhci_pipe_recover(slot, ep)) {
+                if (slot->dev.parent)
+                    usb_hub_port_redo(&slot->dev);
+                else
+                    xhci_port_redo(hc, slot->port);
+                break;
+            }
+        }
+    }
+}
+
 const usb_hc_ops_t xhci_ops = {
     .name           = "xhci",
     .control        = xhci_control,
@@ -309,4 +363,7 @@ const usb_hc_ops_t xhci_ops = {
     .bulk_open      = xhci_bulk_open,
     .bulk           = xhci_bulk,
     .reset_endpoint = xhci_reset_endpoint,
+    .hub_setup      = xhci_hub_setup,
+    .device_add     = xhci_device_add,
+    .device_remove  = xhci_device_remove,
 };

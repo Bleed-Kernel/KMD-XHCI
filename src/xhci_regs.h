@@ -193,6 +193,12 @@
 #define XHCI_SLOT_ENTRIES_MASK      (0x1Fu << 27)
 #define XHCI_SLOT_ROOT_PORT(p)      ((uint32_t)(p) << 16)
 #define XHCI_SLOT_GET_ADDRESS(d3)   ((d3) & 0xFF)
+#define XHCI_SLOT_ROUTE(r)          ((uint32_t)(r) & 0xFFFFF)
+#define XHCI_SLOT_HUB               (1u << 26)
+#define XHCI_SLOT_PORTS(n)          ((uint32_t)(n) << 24)
+#define XHCI_SLOT_TT_HUB(s)         ((uint32_t)(s))
+#define XHCI_SLOT_TT_PORT(p)        ((uint32_t)(p) << 8)
+#define XHCI_SLOT_TT_THINK(t)       ((uint32_t)(t) << 16)
 
 // endpoint context (6.2.3)
 #define XHCI_EP_GET_STATE(d0)       ((d0) & 0x7)
